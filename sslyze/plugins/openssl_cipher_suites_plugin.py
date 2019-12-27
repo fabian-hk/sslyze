@@ -5,7 +5,7 @@ from xml.etree.ElementTree import Element
 import dataclasses
 
 from nassl.ssl_client import OpenSslVersionEnum, ClientCertificateRequested
-from nassl.key_exchange_info import KeyExchangeInfo, OpenSslEvpPkeyEnum
+from nassl.key_exchange_info import KeyExchangeInfo, EcDhKeyExchangeInfo, OpenSslEvpPkeyEnum
 from sslyze.plugins.plugin_base import Plugin, PluginScanCommand
 from sslyze.plugins.plugin_base import PluginScanResult
 from sslyze.server_connectivity_info import ServerConnectivityInfo
@@ -107,6 +107,12 @@ class OpenSslCipherSuitesPlugin(Plugin):
         Tlsv12ScanCommand: OpenSslVersionEnum.TLSV1_2,
         Tlsv13ScanCommand: OpenSslVersionEnum.TLSV1_3,
     }
+
+    # list from https://tools.ietf.org/html/rfc4492#section-5.1.1 and https://tools.ietf.org/html/rfc8446#section-4.2.7
+    CURVE_NAMES = ["X25519", "X448", "sect163k1", "sect163r1", "sect163r2", "sect193r1", "sect193r2", "sect233k1",
+                   "sect233r1", "sect239k1", "sect283k1", "sect283r1", "sect409k1", "sect409r1", "sect571k1",
+                   "sect571r1", "secp160k1", "secp160r1", "secp160r2", "secp192k1", "prime192v1", "secp224k1",
+                   "secp224r1", "secp256k1", "prime256v1", "secp384r1", "secp521r1"]
 
     @classmethod
     def get_available_commands(cls) -> List[Type[PluginScanCommand]]:
@@ -215,6 +221,9 @@ class OpenSslCipherSuitesPlugin(Plugin):
         # Test for the cipher suite preference
         preferred_cipher = self._get_preferred_cipher_suite(server_connectivity_info, ssl_version, accepted_cipher_list)
 
+        # Test for supported elliptic curves
+        supported_curves = self._scan_supported_ecdh_curves(server_connectivity_info, scan_command)
+
         # Generate the results
         plugin_result = CipherSuiteScanResult(
             server_connectivity_info,
@@ -223,6 +232,7 @@ class OpenSslCipherSuitesPlugin(Plugin):
             accepted_cipher_list,
             rejected_cipher_list,
             errored_cipher_list,
+            supported_curves
         )
         return plugin_result
 
@@ -364,6 +374,59 @@ class OpenSslCipherSuitesPlugin(Plugin):
             ssl_connection.close()
         return selected_cipher
 
+    def _scan_supported_ecdh_curves(self, server_connectivity_info: ServerConnectivityInfo, scan_command: PluginScanCommand) -> List[str]:
+        """
+        Check which elliptic curves the server supports for ECDH key exchange.
+
+        Args:
+            server_connectivity_info:
+            scan_command:
+
+        Returns: List of strings (each specifying an elliptic curve)
+
+        """
+        ssl_version = self.SSL_VERSIONS_MAPPING[scan_command.__class__]
+
+        # Don't scan for elliptic curves for SSLv2 and SSLv3 because they do not support elliptic curves key exchange
+        # Source: https://tools.ietf.org/html/rfc6101#appendix-A.6
+        if ssl_version == OpenSslVersionEnum.SSLV2 or ssl_version == OpenSslVersionEnum.SSLV3:
+            return []
+
+        supported_curves = []
+        for curve in self.CURVE_NAMES:
+            ssl_connection = server_connectivity_info.get_preconfigured_ssl_connection(override_ssl_version=ssl_version,
+                                                                                       should_use_legacy_openssl=False)
+
+            if ssl_version == OpenSslVersionEnum.TLSV1_3:
+                # TLSv1.3
+                ssl_connection.ssl_client.set_cipher_list("")
+                # cipher suites source: https://tools.ietf.org/html/rfc8446#appendix-B.4
+                ssl_connection.ssl_client.set_ciphersuites(
+                    "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:"
+                    "TLS_AES_128_CCM_SHA256:TLS_AES_128_CCM_8_SHA256")
+            else:
+                # TLSv1.2 and older
+                # cipher suite source: https://www.openssl.org/docs/man1.0.2/man1/ciphers.html
+                ssl_connection.ssl_client.set_cipher_list("ECDH")
+
+            # set curve to test whether it is supported by the server
+            ssl_connection.ssl_client.set1_groups_list(curve)
+
+            try:
+                ssl_connection.connect()
+                # if no error occurred check if the curve was really used
+                dh_info = ssl_connection.ssl_client.get_dh_info()
+                if isinstance(dh_info, EcDhKeyExchangeInfo) and dh_info.curve_name == curve.lower():
+                    supported_curves.append(curve)
+            except SslHandshakeRejected:
+                pass
+            except Exception:
+                break
+            finally:
+                ssl_connection.close()
+
+        return supported_curves
+
 
 class CipherSuite(ABC):
     def __init__(self, openssl_name: str, ssl_version: OpenSslVersionEnum) -> None:
@@ -474,6 +537,7 @@ class CipherSuiteScanResult(PluginScanResult):
         accepted_cipher_list: List[AcceptedCipherSuite],
         rejected_cipher_list: List[RejectedCipherSuite],
         errored_cipher_list: List[ErroredCipherSuite],
+        supported_curves: List[str]
     ) -> None:
         super().__init__(server_info, scan_command)
 
@@ -488,6 +552,8 @@ class CipherSuiteScanResult(PluginScanResult):
 
         self.errored_cipher_list = errored_cipher_list
         self.errored_cipher_list.sort(key=attrgetter("name"), reverse=True)
+
+        self.supported_curves = supported_curves
 
     def as_xml(self) -> Element:
         is_protocol_supported = True if len(self.accepted_cipher_list) > 0 else False
@@ -539,6 +605,19 @@ class CipherSuiteScanResult(PluginScanResult):
                 )
                 error_xml.append(cipher_xml)
         result_xml.append(error_xml)
+
+        # Output supported elliptic curves
+        curves_xml = Element("ellipticCurves")
+        if len(self.supported_curves) > 0:
+            for curve in self.supported_curves:
+                curve_xml = Element(
+                    "ellipticCurve",
+                    attrib={
+                        "name": curve
+                    },
+                )
+                curves_xml.append(curve_xml)
+        result_xml.append(curves_xml)
 
         return result_xml
 
@@ -632,6 +711,10 @@ class CipherSuiteScanResult(PluginScanResult):
                     cipher_name=rejected_cipher.name, error_message=rejected_cipher.handshake_error_message
                 )
                 result_txt.append(cipher_line_txt)
+
+        # Output supported elliptic curves
+        curves = ":".join(self.supported_curves)
+        result_txt.append(f"Elliptic curves supported by the server: {curves}")
 
         return result_txt
 
@@ -949,7 +1032,6 @@ TLS_OPENSSL_TO_RFC_NAMES_MAPPING = {
     "RSA-PSK-NULL-SHA256": "TLS_RSA_PSK_WITH_NULL_SHA256",
     "RSA-PSK-NULL-SHA384": "TLS_RSA_PSK_WITH_NULL_SHA384",
 }
-
 
 OPENSSL_TO_RFC_NAMES_MAPPING: Dict[OpenSslVersionEnum, Dict[str, str]] = {
     OpenSslVersionEnum.SSLV2: SSLV2_OPENSSL_TO_RFC_NAMES_MAPPING,
