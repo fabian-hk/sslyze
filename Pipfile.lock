@@ -79,7 +79,7 @@
                 "sha256:fa2b38c8519c5a3aa6e2b4e1cf1a549b54acda6adb25397ff542068e73d1ed00"
             ],
             "index": "pypi",
-            "version": "==2.5"
+            "version": "*"
         },
         "dataclasses": {
             "hashes": [
